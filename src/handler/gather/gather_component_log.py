@@ -15,12 +15,13 @@
 @file: gather_component_log.py
 @desc:
 """
+import copy
 import datetime
 import os
 import tarfile
-import threading
 import traceback
 import uuid
+import multiprocessing as mp
 import shutil
 
 from prettytable import PrettyTable
@@ -231,6 +232,7 @@ class GatherComponentLogHandler(BaseShellHandler):
             tasks = []
             self.stdio.start_loading("gather start")
             try:
+                semaphore = mp.Semaphore(self.thread_nums)
                 for node in self.nodes:
                     new_context = self.context
                     new_context.stdio = self.stdio.sub_io()
@@ -241,29 +243,20 @@ class GatherComponentLogHandler(BaseShellHandler):
                             if node_param == "ssh_client" or node_param == "ssher":
                                 continue
                             clear_node[node_param] = node[node_param]
-                        tasks.append(GatherLogOnNode(new_context, clear_node, self.gather_log_conf_dict))
+                        tasks.append(GatherLogOnNode(new_context, clear_node, self.gather_log_conf_dict, semaphore))
                     else:
-                        tasks.append(GatherLogOnNode(new_context, node, self.gather_log_conf_dict))
+                        tasks.append(GatherLogOnNode(new_context, node, self.gather_log_conf_dict, semaphore))
                 file_queue = []
-                pool_sema = threading.BoundedSemaphore(value=self.thread_nums)
-
-                def handle_from_node(task):
-                    with pool_sema:
-                        task.handle()
-
+                result_list = mp.Queue()
                 for task in tasks:
-                    file_thread = threading.Thread(
-                        target=handle_from_node,
-                        args=(task,),
-                    )
+                    semaphore.acquire()
+                    file_thread = mp.Process(target=task.handle, args=(result_list,))
                     file_thread.start()
                     file_queue.append(file_thread)
-                self.stdio.verbose("file_queue len: {0}".format(len(file_queue)))
-                for task_thread in file_queue:
-                    task_thread.join()
-                self.stdio.verbose("start get gather_tuples")
-                for task in tasks:
-                    self.gather_tuples.append(task.get_result())
+                for file_thread in file_queue:
+                    file_thread.join()
+                for _ in range(result_list.qsize()):
+                    self.gather_tuples.append(result_list.get())
                 self.stdio.verbose("gather_tuples: {0}".format(self.gather_tuples))
                 summary_tuples = self.__get_overall_summary(self.gather_tuples)
                 self.stdio.print(summary_tuples)
@@ -362,13 +355,14 @@ class GatherComponentLogHandler(BaseShellHandler):
 
 
 class GatherLogOnNode:
-    def __init__(self, context, node, config):
+    def __init__(self, context, node, config, semaphore):
         self.context = context
         self.ssh_client = None
         self.stdio = context.stdio
         self.config = config
         self.node = node
         self.target = self.config.get("target")
+        self.semaphore = semaphore
 
         # mkdir tmp_dir
         self.tmp_dir = self.config.get("tmp_dir")
@@ -392,11 +386,13 @@ class GatherLogOnNode:
         self.file_number_limit = self.config.get("file_number_limit")
         self.file_size_limit = self.config.get("file_size_limit")
         self.gather_tuple = {"node": "", "success": "Fail", "info": "", "file_size": 0, "file_path": ""}
+        self.result_list = None
 
     def get_result(self):
         return self.gather_tuple
 
-    def handle(self):
+    def handle(self, result_list=None):
+        self.result_list = result_list
         self.ssh_client = SshClient(self.context, self.node)
         self.gather_tuple["node"] = self.ssh_client.get_name()
         self.tmp_dir = os.path.join(self.tmp_dir, "obdiag_gather_{0}".format(str(uuid.uuid4())[:6]))
@@ -472,7 +468,9 @@ class GatherLogOnNode:
             self.ssh_client.exec_cmd("rm -rf {0}".format(tmp_log_dir))
             self.stdio.verbose("gather_log_on_node {0} finished".format(self.ssh_client.get_ip()))
             self.stdio.verbose("gather_log_on_node {0} gather_tuple: {1}".format(self.ssh_client.get_ip(), self.gather_tuple))
-            self.stdio.verbose("gather_log_on_node {0} done".format(self.ssh_client.get_ip()))
+            if self.result_list:
+                self.result_list.put(self.gather_tuple)
+            self.semaphore.release()
 
     def __grep_log_to_tmp(self, logs_name, tmp_log_dir):
         grep_cmd = ""
