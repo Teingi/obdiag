@@ -128,6 +128,20 @@ git clone https://github.com/your_username/your_repo_here.git
 - 代码检查：PR一旦触发，流水线会自动代码格式化检查以及安全检查。
 - 自动构建：PR一旦触发，就会自动将你的改动编译成RPM和DEB两种软件包。
 
+## 模块 Owner
+| 模块 | Owner  | 
+|---------|--------|
+|src/common| <ul><li> @wayyoungboy </li><li> @Teingi </li></ul>|
+|src/handler/analyzer| <ul><li> @oraclebird </li><li> @Teingi </li></ul>|
+|src/handler/checker| <ul><li> @wayyoungboy </li></ul>|
+|src/handler/display| <ul><li> @RoyceHwangCN </li></ul>|
+|src/handler/gather| <ul><li> @Teingi </li></ul>|
+|src/handler/rca| <ul><li> @wayyoungboy </li></ul>|
+|plugin/check| <ul><li>  @jingyd66 </li></ul>|
+|plugin/display| <ul><li> @RoyceHwangCN </li><li> @zhangry7777 </li></ul>|
+|plugin/gather| <ul><li> @xiaodong-ji  </li><li> @zhangry7777 </li></ul>|
+|plugin/rca| <ul><li> @duzp111  </li><li> @jingyd66 </li></ul>|
+
 
 # 许可证
 

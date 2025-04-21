@@ -135,6 +135,20 @@ From here on, sit back as our GitHub Actions workflow takes over:
 - Automated Build: Our carefully crafted workflow will automatically trigger, compiling your changes into both RPM and DEB packages.
 - Quality Assurance: It doesn't stop at compilation; tests are also run to ensure the integrity of the build and your code's compatibility.
 
+## Module Owner
+| Module | Owner  | 
+|---------|--------|
+|src/common| <ul><li> @wayyoungboy </li><li> @Teingi </li></ul>|
+|src/handler/analyzer| <ul><li> @oraclebird </li><li> @Teingi </li></ul>|
+|src/handler/checker| <ul><li> @wayyoungboy </li></ul>|
+|src/handler/display| <ul><li> @RoyceHwangCN </li></ul>|
+|src/handler/gather| <ul><li> @Teingi </li></ul>|
+|src/handler/rca| <ul><li> @wayyoungboy </li></ul>|
+|plugin/check| <ul><li>  @jingyd66 </li></ul>|
+|plugin/display| <ul><li> @RoyceHwangCN </li><li> @zhangry7777 </li></ul>|
+|plugin/gather| <ul><li> @xiaodong-ji  </li><li> @zhangry7777 </li></ul>|
+|plugin/rca| <ul><li> @duzp111  </li><li> @jingyd66 </li></ul>|
+
 
 # Licencing
 OceanBase Database is under MulanPubL - 2.0 license. You can freely copy and use the source code. When you modify or
