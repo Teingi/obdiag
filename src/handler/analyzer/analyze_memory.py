@@ -283,7 +283,12 @@ class AnalyzeMemoryHandler(object):
                     ctx_memory_info_dict = dict()
                     mod_memory_info_dict = dict()
                     for t in sorted(tenant_memory_info_dict[tenant_id].keys()):
-                        for ctx in tenant_memory_info_dict[tenant_id][t]['ctx_info']:
+                        # Check if ctx_info exists, some time points may only have tenant-level summary without ctx details
+                        ctx_info_list = tenant_memory_info_dict[tenant_id][t].get('ctx_info', [])
+                        if not ctx_info_list:
+                            # Skip this time point if no ctx_info available
+                            continue
+                        for ctx in ctx_info_list:
                             ctx_name = ctx['ctx_name']
                             if ctx_name in ctx_memory_info_dict:
                                 ctx_memory_info_dict[ctx_name][t] = ctx['hold_bytes']
@@ -595,7 +600,6 @@ class AnalyzeMemoryHandler(object):
         """
         self.stdio.verbose("start parse log {0}".format(file_full_path))
         memory_print_line_list = self.__parse_memory_label(file_full_path)
-        tenant_dict = dict()
         if memory_print_line_list:
             with open(file_full_path, 'r', encoding='utf8', errors='replace') as file:
                 line_num = 0
@@ -656,6 +660,9 @@ class AnalyzeMemoryHandler(object):
                             if '[MEMORY]' in line or 'MemDump' in line or 'ob_tenant_ctx_allocator' in line:
                                 if '[MEMORY] tenant:' in line:
                                     tenant_id = line.split('tenant:')[1].split(',')[0].strip()
+                                    tenant_dict = dict()  # 为每个租户创建独立的字典
+                                    # Initialize ctx_info as empty list to avoid KeyError later
+                                    tenant_dict['ctx_info'] = []
                                     if 'rpc_' in line:
                                         hold_bytes = line.split('hold:')[1].split('rpc_')[0].strip()
                                         rpc_hold_bytes = line.split('rpc_hold:')[1].split('cache_hold')[0].strip()

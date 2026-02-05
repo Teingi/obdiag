@@ -5,8 +5,8 @@ SHELL := /bin/bash
 PROJECT_PATH := $(shell pwd)
 WORK_DIR := $(shell pwd)
 OBDIAG_HOME ?= $(HOME)/.obdiag
-RELEASE := $(shell date +%Y%m%d%H%M)
-OBDIAG_VERSION ?= 4.0.0
+RELEASE ?= $(shell date +%Y%m%d%H%M)
+OBDIAG_VERSION ?= 4.1.0
 
 # URLs for obstack downloads
 OBUTILS_AARCH64_URL := https://obbusiness-private.oss-cn-shanghai.aliyuncs.com/download-center/opensource/observer/v4.3.5_CE/oceanbase-ce-utils-4.3.5.0-100000202024123117.el7.aarch64.rpm
@@ -107,14 +107,10 @@ check_python:
 		(echo "Error: Python version must be >= $(PYTHON_MIN_MAJOR).$(PYTHON_MIN_MINOR)" && exit 1)
 	@echo "Python version check passed"
 
-# Install requirements
+# Install requirements (from pyproject.toml)
 install_requirements:
-	@echo "Installing requirements..."
-	@if [ -f "$(PROJECT_PATH)/requirements3.txt" ]; then \
-		pip3 install -r $(PROJECT_PATH)/requirements3.txt; \
-	else \
-		echo "No requirements3.txt file found"; \
-	fi
+	@echo "Installing dependencies from pyproject.toml..."
+	@pip3 install -e "$(PROJECT_PATH)"
 
 # Backup obdiag folders
 backup_obdiag:
