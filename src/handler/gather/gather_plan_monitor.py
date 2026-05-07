@@ -60,6 +60,9 @@ class GatherPlanMonitorHandler(object):
         self.ob_version = "4.2.5.0"
         self.skip = None
         self.db_tables = []
+        # query_sql from sql_audit may be very long (e.g. INSERT with blob hex); cap EXPLAIN to avoid 1064 spam.
+        # See obdiag#1202.
+        self._max_explain_sql_chars = 65536
         if self.context.get_variable("gather_timestamp", None):
             self.gather_timestamp = self.context.get_variable("gather_timestamp")
         else:
@@ -132,8 +135,8 @@ class GatherPlanMonitorHandler(object):
             if len(result_sql_audit_by_trace_id_limit1) > 0:
                 trace = result_sql_audit_by_trace_id_limit1[0]
                 trace_id = trace[0]
-                user_sql = trace[1]
-                sql = trace[1]
+                user_sql = trace[1] or ""
+                sql = trace[1] or ""
                 tenant_name = trace[6]
                 db_name = trace[8]
                 plan_id = trace[9]
@@ -181,14 +184,14 @@ class GatherPlanMonitorHandler(object):
                 self.stdio.verbose("[sql plan monitor report task] report sql_audit")
                 if not self.report_sql_audit():
                     return
-                # 输出sql explain的信息
-                self.stdio.verbose("[sql plan monitor report task] report plan explain, sql: [{0}]".format(sql))
+                # 输出sql explain的信息（长 SQL / 含二进制时不要打全量，避免刷屏）
+                self.stdio.verbose("[sql plan monitor report task] report plan explain, sql (truncated): [{0}]".format(self._truncate_sql_for_log(sql)))
                 self.report_plan_explain(db_name, sql)
                 # 输出plan cache的信息
                 self.stdio.verbose("[sql plan monitor report task] report plan cache")
                 self.report_plan_cache(plan_explain_sql)
                 # dbms_xplan.display_cursor
-                display_cursor_sql = "SELECT DBMS_XPLAN.DISPLAY_CURSOR({plan_id}, 'all', '{svr_ip}',  {svr_port}, {tenant_id}) FROM DUAL".format(plan_id=plan_id, svr_ip=svr_ip, svr_port=svr_port, tenant_id=tenant_id)
+                display_cursor_sql = "SELECT CONVERT(DBMS_XPLAN.DISPLAY_CURSOR({plan_id}, 'all', '{svr_ip}',  {svr_port}, {tenant_id}) USING utf8mb4) FROM DUAL".format(plan_id=plan_id, svr_ip=svr_ip, svr_port=svr_port, tenant_id=tenant_id)
                 self.report_display_cursor_obversion4(display_cursor_sql)
                 # 输出表结构的信息
                 self.stdio.verbose("[sql plan monitor report task] report table schema")
@@ -284,6 +287,7 @@ class GatherPlanMonitorHandler(object):
                 return False
 
             if StringUtils.validate_db_info(self.db_conn):
+                self.__validate_database()
                 self.__init_db_connector()
                 return True
             else:
@@ -292,6 +296,50 @@ class GatherPlanMonitorHandler(object):
         except Exception as e:
             self.db_connector = self.sys_connector
             self.stdio.exception("init db connector, error: {0}, please check --env option ".format(e))
+
+    def __validate_database(self):
+        """
+        Validate that the database in db_conn exists before creating db_connector.
+        Uses user tenant connection (db_conn) because information_schema.SCHEMATA is
+        tenant-scoped in OceanBase: sys tenant can only see sys schemas, while user
+        databases (e.g. ad_marketing) live in user tenants (e.g. t_ad_marketing).
+        When database name is wrong, report clear error and raise to terminate collection.
+        See: https://github.com/oceanbase/obdiag/issues/1155
+        """
+        if not getattr(self, 'db_conn', None) or not self.db_conn.get("database"):
+            return True
+        db_name = self.db_conn.get("database")
+        db_name_escaped = db_name.replace("'", "''")
+        try:
+            # Use user tenant connector (no database) to avoid connection failure when
+            # database is wrong. information_schema.SCHEMATA is tenant-level,
+            # sys tenant only sees sys schemas, user databases are in user tenants.
+            db_conn = OBConnector(
+                context=self.context,
+                ip=self.db_conn.get("host"),
+                port=self.db_conn.get("port"),
+                username=self.db_conn.get("user"),
+                password=self.db_conn.get("password") or "",
+                database=None,
+                timeout=100,
+            )
+            sql_mysql = "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{0}'".format(db_name_escaped)
+            sql_oracle = "SELECT 1 FROM oceanbase.gv$database WHERE UPPER(database_name) = UPPER('{0}') LIMIT 1".format(db_name_escaped)
+            result = None
+            try:
+                result = db_conn.execute_sql(sql_mysql)
+            except Exception:
+                result = db_conn.execute_sql(sql_oracle)
+            if not result or len(result) == 0:
+                err_msg = "Database '{0}' does not exist. Please check --env database=.".format(db_name)
+                self.stdio.error(err_msg)
+                raise Exception(err_msg)
+        except Exception as e:
+            if "does not exist" in str(e):
+                raise
+            self.stdio.error("Failed to validate database '{0}': {1}".format(db_name, e))
+            raise Exception("Database '{0}' may not exist. Please check --env database=.".format(db_name)) from e
+        return True
 
     @staticmethod
     def __get_overall_summary(node_summary_tuple):
@@ -319,6 +367,57 @@ class GatherPlanMonitorHandler(object):
             self.stdio.warn(e)
             return None
 
+    def __write_create_tables_sql(self, table_info):
+        """
+        Extract CREATE TABLE DDL from tabledump result and write to create_tables.sql
+        for direct execution. See: https://github.com/oceanbase/obdiag/issues/1010
+        """
+        try:
+            if not table_info or "CREATE TABLE" not in table_info:
+                return
+            out_dir = os.path.dirname(self.report_file_path)
+            create_tables_file = os.path.join(
+                out_dir,
+                "create_tables_{0}.sql".format(TimeUtils.timestamp_to_filename_time(self.gather_timestamp)),
+            )
+            ddls = []
+            for segment in table_info.split("obclient >")[1:]:
+                idx = segment.find("CREATE TABLE")
+                if idx >= 0:
+                    ddl = segment[idx:].strip()
+                    if ddl and not ddl.rstrip().endswith(";"):
+                        ddl = ddl + ";"
+                    if ddl:
+                        ddls.append(ddl)
+            if not ddls:
+                return
+            default_db = self.db_conn.get("database") if self.db_conn else None
+            with open(create_tables_file, "w", encoding="utf-8") as f:
+                f.write("-- Directly executable create table script (from plan-monitor)\n")
+                if default_db:
+                    f.write("USE `{0}`;\n\n".format(default_db.replace("`", "``")))
+                f.write("\n\n".join(ddls) + "\n\n")
+        except Exception as e:
+            self.stdio.verbose("write create_tables.sql failed: {0}".format(e))
+
+    def _deduplicate_parse_tables(self, parse_tables, default_db=None):
+        """
+        Deduplicate parse_tables by (db_name, table_name). Keep first occurrence.
+        When SQL references same table multiple times (e.g. FROM t1 JOIN t1), only process once.
+        See: https://github.com/oceanbase/obdiag/issues/1054
+        """
+        if not parse_tables:
+            return []
+        seen = set()
+        result = []
+        for db_name, table_name in parse_tables:
+            db_resolved = db_name if db_name else (default_db or (self.db_conn.get("database") if self.db_conn else None))
+            key = (db_resolved, table_name)
+            if key not in seen:
+                seen.add(key)
+                result.append((db_name, table_name))
+        return result
+
     def report_schema(self, sql, tenant_name):
         try:
             schemas = ""
@@ -326,6 +425,7 @@ class GatherPlanMonitorHandler(object):
             if self.enable_dump_db:
                 parser = SQLTableExtractor()
                 parse_tables = parser.parse(sql)
+                parse_tables = self._deduplicate_parse_tables(parse_tables, self.db_conn.get("database") if self.db_conn else None)
                 for t in parse_tables:
                     db_name, table_name = t
                     try:
@@ -342,12 +442,16 @@ class GatherPlanMonitorHandler(object):
                         handler = GatherTableDumpHandler(self.context, self.local_stored_path, is_inner=True)
                         handler.handle()
                     except Exception as e:
-                        pass
+                        db_for_msg = db_name or (self.db_conn.get("database") if self.db_conn else "?")
+                        err_msg = "Database '{0}' may not exist or table '{1}' is missing. Please check --env database=.".format(db_for_msg, table_name)
+                        self.stdio.error("Failed to gather table schema for {0}.{1}: {2}".format(db_for_msg, table_name, e))
+                        raise Exception(err_msg) from e
             table_info_file = os.path.join(self.local_stored_path, "obdiag_tabledump_result_{0}.txt".format(TimeUtils.timestamp_to_filename_time(self.gather_timestamp)))
             self.stdio.verbose("table info file path:{0}".format(table_info_file))
             table_info = self.get_table_info(table_info_file)
             if table_info:
                 schemas = schemas + "<pre style='margin:20px;border:1px solid gray;'>%s</pre>" % table_info
+                self.__write_create_tables_sql(table_info)
             if len(table_info_file) > 25:
                 FileUtil.rm(table_info_file)
             cursor = self.sys_connector.execute_sql_return_cursor("show variables like '%parallel%'")
@@ -367,9 +471,9 @@ class GatherPlanMonitorHandler(object):
             self.__report("<div><h2 id='schema_anchor'>SCHEMA 信息</h2><div id='schema' style='display: none'>" + schemas + "</div></div>")
             cursor.close()
         except Exception as e:
-            self.stdio.exception("report table schema failed %s" % sql)
+            self.stdio.exception("report table schema failed %s" % self._truncate_sql_for_log(sql, 512))
             self.stdio.exception(repr(e))
-            pass
+            raise
 
     def report_pre(self, s):
         pre = f'''<pre style='margin:20px;border:1px solid gray;'>{s}</pre>'''
@@ -403,7 +507,7 @@ class GatherPlanMonitorHandler(object):
                 val = "%s.%06d" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item[v] / 1000000)), item[v] - (item[v] / 1000000) * 1000000)
             else:
                 val = str(item[v])
-        except Exception as e:
+        except Exception:
             val = str(item[v])
         return "" if item[n] == 0 else self.STAT_NAME[item[n]]["name"] + "(" + val + ");<br/>"
 
@@ -417,9 +521,9 @@ class GatherPlanMonitorHandler(object):
                 val = "%0.3fMB" % (float(item[v]) / 1024.0 / 1024)
             else:
                 val = None
-        except Exception as e:
+        except Exception:
             val = str(item[v])
-        return "" if val == None else self.STAT_NAME[item[n]]["name"] + "(" + val + ");<br/>"
+        return "" if val is None else self.STAT_NAME[item[n]]["name"] + "(" + val + ");<br/>"
 
     def detail_otherstat_explain(self, item):
         otherstat = ""
@@ -444,9 +548,9 @@ class GatherPlanMonitorHandler(object):
     def report_detail_graph_data(self, ident, cursor, title=''):
         data = "<script> var %s = [" % ident
         for item in cursor:
-            start = 0 if None == item['FIRST_CHANGE_TS'] else item['FIRST_CHANGE_TS']
-            end = 0 if None == item['LAST_CHANGE_TS'] else item['LAST_CHANGE_TS']
-            rows = 0 if None == item['OUTPUT_ROWS'] else item['OUTPUT_ROWS']
+            start = 0 if None is item['FIRST_CHANGE_TS'] else item['FIRST_CHANGE_TS']
+            end = 0 if None is item['LAST_CHANGE_TS'] else item['LAST_CHANGE_TS']
+            rows = 0 if None is item['OUTPUT_ROWS'] else item['OUTPUT_ROWS']
             otherstat = self.detail_otherstat_explain(item)
             data = data + "{start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d, tag:'op', depth:%d, rescan:%d, svr_ip:'%s', otherstat:'%s'}," % (
                 start,
@@ -468,9 +572,9 @@ class GatherPlanMonitorHandler(object):
     def report_detail_graph_data_obversion4(self, ident, cursor, title=''):
         data = "<script> var %s = [" % ident
         for item in cursor:
-            start = 0 if None == item['FIRST_CHANGE_TS'] else item['FIRST_CHANGE_TS']
-            end = 0 if None == item['LAST_CHANGE_TS'] else item['LAST_CHANGE_TS']
-            rows = 0 if None == item['OUTPUT_ROWS'] else item['OUTPUT_ROWS']
+            start = 0 if None is item['FIRST_CHANGE_TS'] else item['FIRST_CHANGE_TS']
+            end = 0 if None is item['LAST_CHANGE_TS'] else item['LAST_CHANGE_TS']
+            rows = 0 if None is item['OUTPUT_ROWS'] else item['OUTPUT_ROWS']
             otherstat = self.detail_otherstat_explain(item)
             data = data + "{cpu:%f, io:%f, start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d, tag:'op', depth:%d, rescan:%d, svr_ip:'%s', otherstat:'%s'}," % (
                 item['MY_CPU_TIME'],
@@ -502,7 +606,6 @@ class GatherPlanMonitorHandler(object):
             op_id = item['PLAN_LINE_ID']
             op = item['PLAN_OPERATION']
             depth = item['PLAN_DEPTH']
-            est_rows = 0
             threads = item['THREAD_NUM']
             my_cpu_time = item['MY_CPU_TIME']
             my_io_time = item['MY_IO_TIME']
@@ -529,10 +632,10 @@ class GatherPlanMonitorHandler(object):
     def report_dfo_agg_graph_data(self, cursor, title=''):
         data = "<script> var agg_serial = ["
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
-            end = 0 if None == item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
-            est_rows = 0 if None == item['EST_ROWS'] else item['EST_ROWS']
+            start = 0 if None is item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
+            end = 0 if None is item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            est_rows = 0 if None is item['EST_ROWS'] else item['EST_ROWS']
             otherstat = self.dfo_otherstat_explain(item)
             data = data + "{start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d,est_rows:%d, tag:'dfo', depth:%d, otherstat:'%s'}," % (
                 start,
@@ -553,11 +656,11 @@ class GatherPlanMonitorHandler(object):
     def report_dfo_agg_graph_data_obversion4(self, cursor, title=''):
         data = "<script> var agg_serial = ["
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
-            end = 0 if None == item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
-            skewness = 0 if None == item['SKEWNESS'] else item['SKEWNESS']
-            est_rows = 0 if None == item['EST_ROWS'] else item['EST_ROWS']
+            start = 0 if None is item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
+            end = 0 if None is item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            skewness = 0 if None is item['SKEWNESS'] else item['SKEWNESS']
+            est_rows = 0 if None is item['EST_ROWS'] else item['EST_ROWS']
             otherstat = self.dfo_otherstat_explain(item)
             data = data + "{cpu:%f,io:%f,start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d,est_rows:%d, tag:'dfo', depth:%d, otherstat:'%s', skewness:%.2f}," % (
                 item['MY_CPU_TIME'],
@@ -581,10 +684,10 @@ class GatherPlanMonitorHandler(object):
     def report_dfo_sched_agg_graph_data(self, cursor, title=''):
         data = "<script> var agg_sched_serial = ["
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_REFRESH_TS'] else item['MIN_FIRST_REFRESH_TS']
-            end = 0 if None == item['MAX_LAST_REFRESH_TS'] else item['MAX_LAST_REFRESH_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
-            est_rows = 0 if None == item['EST_ROWS'] else item['EST_ROWS']
+            start = 0 if None is item['MIN_FIRST_REFRESH_TS'] else item['MIN_FIRST_REFRESH_TS']
+            end = 0 if None is item['MAX_LAST_REFRESH_TS'] else item['MAX_LAST_REFRESH_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            est_rows = 0 if None is item['EST_ROWS'] else item['EST_ROWS']
             otherstat = self.dfo_otherstat_explain(item)
             data = data + "{start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d,est_rows:%d, tag:'dfo', " "depth:%d, otherstat:'%s'}," % (
                 start,
@@ -605,11 +708,11 @@ class GatherPlanMonitorHandler(object):
     def report_dfo_sched_agg_graph_data_obversion4(self, cursor, title=''):
         data = "<script> var agg_sched_serial = ["
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_REFRESH_TS'] else item['MIN_FIRST_REFRESH_TS']
-            end = 0 if None == item['MAX_LAST_REFRESH_TS'] else item['MAX_LAST_REFRESH_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
-            skewness = 0 if None == item['SKEWNESS'] else item['SKEWNESS']
-            est_rows = 0 if None == item['EST_ROWS'] else item['EST_ROWS']
+            start = 0 if None is item['MIN_FIRST_REFRESH_TS'] else item['MIN_FIRST_REFRESH_TS']
+            end = 0 if None is item['MAX_LAST_REFRESH_TS'] else item['MAX_LAST_REFRESH_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            skewness = 0 if None is item['SKEWNESS'] else item['SKEWNESS']
+            est_rows = 0 if None is item['EST_ROWS'] else item['EST_ROWS']
             otherstat = self.dfo_otherstat_explain(item)
             data = data + "{cpu:%f,io:%f,start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',rows:%d,est_rows:%d, " "tag:'dfo', depth:%d, otherstat:'%s', skewness:%.2f}," % (
                 item['MY_CPU_TIME'],
@@ -634,9 +737,9 @@ class GatherPlanMonitorHandler(object):
     def report_svr_agg_graph_data(self, ident, cursor, title=''):
         data = "<script> var %s = [" % ident
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
-            end = 0 if None == item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            start = 0 if None is item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
+            end = 0 if None is item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
             data = data + "{start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',svr:'%s',rows:%d, " "tag:'sqc', depth:%d}," % (
                 start,
                 end,
@@ -656,10 +759,10 @@ class GatherPlanMonitorHandler(object):
     def report_svr_agg_graph_data_obversion4(self, ident, cursor, title=''):
         data = "<script> var %s = [" % ident
         for item in cursor:
-            start = 0 if None == item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
-            end = 0 if None == item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
-            rows = 0 if None == item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
-            skewness = 0 if None == item['SKEWNESS'] else item['SKEWNESS']
+            start = 0 if None is item['MIN_FIRST_CHANGE_TS'] else item['MIN_FIRST_CHANGE_TS']
+            end = 0 if None is item['MAX_LAST_CHANGE_TS'] else item['MAX_LAST_CHANGE_TS']
+            rows = 0 if None is item['TOTAL_OUTPUT_ROWS'] else item['TOTAL_OUTPUT_ROWS']
+            skewness = 0 if None is item['SKEWNESS'] else item['SKEWNESS']
             data = data + "{cpu:%f,io:%f,start:%f, end:%f, diff:%f, opid:%s, op:'%s',tid:'%s',svr:'%s',rows:%d, " "tag:'sqc', depth:%d, skewness:%.2f}," % (
                 item['MY_CPU_TIME'],
                 item['MY_IO_TIME'],
@@ -734,7 +837,7 @@ class GatherPlanMonitorHandler(object):
                 return True
             else:
                 raise ValueError("Failed to match MySQL version")
-        except Exception as e:
+        except Exception:
             # Detect Oracle mode
             try:
                 data = self.sys_connector.execute_sql("select SUBSTR(BANNER, 11, 100) from V$VERSION;")
@@ -812,9 +915,17 @@ class GatherPlanMonitorHandler(object):
 
     def full_audit_sql_by_trace_id_sql(self, trace_id):
         if self.tenant_mode == 'mysql':
-            sql = "select /*+ sql_audit */ * from oceanbase.%s where trace_id = '%s' " "AND client_ip IS NOT NULL ORDER BY QUERY_SQL ASC, REQUEST_ID limit 1000" % (self.sql_audit_name, trace_id)
+            if self.ob_major_version >= 4:
+                cols = GlobalSqlMeta().get_value(key="sql_audit_item_mysql_obversion4")
+            else:
+                cols = GlobalSqlMeta().get_value(key="sql_audit_item_mysql")
+            sql = "select /*+ sql_audit */ %s from oceanbase.%s where trace_id = '%s' AND client_ip IS NOT NULL ORDER BY REQUEST_ID limit 1000" % (cols, self.sql_audit_name, trace_id)
         else:
-            sql = "select /*+ sql_audit */ * from sys.%s where trace_id = '%s' AND  " "length(client_ip) > 4 ORDER BY  REQUEST_ID limit 1000" % (self.sql_audit_name, trace_id)
+            if self.ob_major_version >= 4:
+                cols = GlobalSqlMeta().get_value(key="sql_audit_item_oracle_obversion4")
+            else:
+                cols = GlobalSqlMeta().get_value(key="sql_audit_item_oracle")
+            sql = "select /*+ sql_audit */ %s from sys.%s where trace_id = '%s' AND length(client_ip) > 4 ORDER BY REQUEST_ID limit 1000" % (cols, self.sql_audit_name, trace_id)
         return sql
 
     def sql_plan_monitor_dfo_op_sql(self, tenant_id, plan_id, trace_id, svr_ip, svr_port):
@@ -1052,11 +1163,45 @@ class GatherPlanMonitorHandler(object):
             self.stdio.exception("sql_audit> %s" % sql)
             self.stdio.exception(repr(e))
 
+    def _truncate_sql_for_log(self, raw_sql, max_len=512):
+        if raw_sql is None:
+            return ""
+        if len(raw_sql) <= max_len:
+            return raw_sql
+        return raw_sql[:max_len] + "...<truncated,len=%s>" % len(raw_sql)
+
+    def _sql_eligible_for_explain_extended(self, raw_sql):
+        """
+        EXPLAIN extended requires valid textual SQL. query_sql for INSERT with large literals
+        can exceed length limits or contain control chars that cause 1064 syntax errors.
+        """
+        if not raw_sql or not isinstance(raw_sql, str):
+            return False
+        if len(raw_sql) > self._max_explain_sql_chars:
+            return False
+        if "\x00" in raw_sql:
+            return False
+        # ASCII control chars (excluding tab/LF/CR) often indicate binary fragments in audit text
+        ctrl = sum(1 for c in raw_sql if ord(c) < 32 and c not in "\t\n\r")
+        if ctrl > 10:
+            return False
+        if len(raw_sql) > 1000 and (ctrl / float(len(raw_sql))) > 0.001:
+            return False
+        # Long INSERT from audit frequently embeds blob/hex; EXPLAIN usually fails even under length cap
+        lead = raw_sql.lstrip()
+        if len(lead) >= 6 and lead[:6].upper() == "INSERT" and len(raw_sql) > 8192:
+            return False
+        return True
+
     def report_plan_explain(self, db_name, raw_sql):
+        if not self._sql_eligible_for_explain_extended(raw_sql):
+            self.stdio.warn("skip EXPLAIN extended: query_sql is not eligible (empty, too long, null/replacement chars, " "high control-char ratio, or long INSERT; common with binary/blob). len=%s" % (len(raw_sql) if raw_sql else 0))
+            self.__report("<pre>EXPLAIN extended skipped: query_sql not suitable for text EXPLAIN " "(e.g. INSERT with large binary / blob in sql_audit).</pre>")
+            return
         explain_sql = "explain extended %s" % raw_sql
         try:
             sql_explain_cursor = self.db_connector.execute_sql_return_cursor(explain_sql)
-            self.stdio.verbose("execute SQL: %s", explain_sql)
+            self.stdio.verbose("execute SQL: %s", self._truncate_sql_for_log(explain_sql, 1024))
             sql_explain_result_sql = "%s" % explain_sql
             sql_explain_result = from_db_cursor(sql_explain_cursor)
 
@@ -1073,8 +1218,14 @@ class GatherPlanMonitorHandler(object):
             self.report_pre(sql_explain_result)
             self.stdio.verbose("report sql_explain_result complete")
         except Exception as e:
-            self.stdio.exception("plan explain> %s" % explain_sql)
-            self.stdio.exception(repr(e))
+            err_no = e.args[0] if getattr(e, "args", None) else None
+            if err_no == 1064:
+                self.stdio.warn("skip EXPLAIN extended: server syntax error (1064); query_sql from sql_audit may contain " "binary or fragments not valid as SQL text. len=%s" % (len(raw_sql) if raw_sql else 0))
+                self.__report("<pre>EXPLAIN extended skipped: syntax error 1064 (query_sql not valid for EXPLAIN, " "e.g. binary in audit text).</pre>")
+                self.stdio.verbose("EXPLAIN 1064 (truncated hint): %s" % self._truncate_sql_for_log(explain_sql, 256))
+            else:
+                self.stdio.warn("plan explain failed: %s" % (e,))
+                self.stdio.verbose("plan explain (truncated): %s" % self._truncate_sql_for_log(explain_sql, 1024))
             pass
 
     def report_sql_plan_monitor_dfo_op(self, sql):
@@ -1209,8 +1360,10 @@ class GatherPlanMonitorHandler(object):
 
     def get_stat_stale_yes_tables(self, sql):
         try:
+            self.db_tables = []
             parser = SQLTableExtractor()
             parse_tables = parser.parse(sql)
+            parse_tables = self._deduplicate_parse_tables(parse_tables)
             for t in parse_tables:
                 db_name, table_name = t
                 if not db_name:
@@ -1248,6 +1401,7 @@ class GatherPlanMonitorHandler(object):
         try:
             parser = SQLTableExtractor()
             parse_tables = parser.parse(sql)
+            parse_tables = self._deduplicate_parse_tables(parse_tables, default_db_name)
             if not parse_tables:
                 self.stdio.verbose("No tables found in SQL, skip collation check")
                 return
@@ -1406,6 +1560,7 @@ class GatherPlanMonitorHandler(object):
         try:
             parser = SQLTableExtractor()
             parse_tables = parser.parse(sql)
+            parse_tables = self._deduplicate_parse_tables(parse_tables, default_db_name)
             if not parse_tables:
                 self.stdio.verbose("No tables found in SQL, skip histogram report")
                 return

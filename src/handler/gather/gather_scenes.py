@@ -22,7 +22,7 @@ from src.common.result_type import ObdiagResult
 from src.common.stdio import SafeStdio
 import datetime
 from src.handler.gather.scenes.base import SceneBase
-from src.common.obdiag_exception import OBDIAGFormatException
+from src.common.exception import OBDIAGFormatException
 from src.handler.gather.scenes.list import GatherScenesListHandler
 from src.common.tool import DirectoryUtil
 from src.common.tool import StringUtils
@@ -77,7 +77,7 @@ class GatherSceneHandler(SafeStdio):
         self.__init_task_names()
         self.execute()
         if self.is_inner:
-            result = self.__get_sql_result()
+            self.__get_sql_result()
             return ObdiagResult(ObdiagResult.SUCCESS_CODE, data={"store_dir": self.report_path})
         else:
             self.__print_result()
@@ -212,7 +212,8 @@ class GatherSceneHandler(SafeStdio):
             else:
                 self.from_time_str = (now_time - datetime.timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
             self.stdio.print('gather from_time: {0}, to_time: {1}'.format(self.from_time_str, self.to_time_str))
-        if store_dir_option:
+        # Embedded gather (analyze sql): keep constructor gather_pack_dir; do not apply parent --store_dir here.
+        if store_dir_option and not self.is_inner:
             if not os.path.exists(os.path.abspath(store_dir_option)):
                 self.stdio.warn('args --store_dir [{0}] incorrect: No such directory, Now create it'.format(os.path.abspath(store_dir_option)))
                 os.makedirs(os.path.abspath(store_dir_option))

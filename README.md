@@ -98,7 +98,9 @@ obdiag envisions an open community. We welcome your contributions in any form:
 |3.7.0|2025.08| 2025.09.09 |<ul><li> Support pip install obdiag-mcp </li><li> Check Scenario Expansion </li></ul>|
 |3.7.1|2025.09| 2025.10.22 |<ul><li> Check Scenario Expansion </li></ul>|
 |3.7.2|2025.10| 2025.11.27 |<ul><li> Check Scenario Expansion </li></ul>|
-|4.0.0|2025.12| 2026.01.07 |<ul><li> Add `obdiag tool ai_assistant` command, AI intelligent diagnostic assistant (BETA)</li><li> Add `obdiag tool io_performance` command, disk IO performance detection tool</li><li> Add `obdiag tool config_check` command, configuration validation tool</li><li> Add `obdiag display scene run --scene=observer.compaction` command, compaction status display scene</li><li> Root Cause Analysis Scenario Expansion </li></ul>|
+|4.0.0|2025.12| 2026.01.07 |<ul><li> Add `obdiag agent` command, intelligent diagnostic agent (BETA)</li><li> Add `obdiag tool io_performance` command, disk IO performance detection tool</li><li> Add `obdiag tool config_check` command, configuration validation tool</li><li> Add `obdiag display scene run --scene=observer.compaction` command, compaction status display scene</li><li> Root Cause Analysis Scenario Expansion </li></ul>|
+|4.1.0|2026.02| 2026.02.11 |<ul><li> Transition to pyproject.toml for dependency management</li><li> Add `obdiag display-trace` command for execution log troubleshooting</li><li> Add `obdiag display scene run --scene=observer.log_volume_statistics` for CLOG capacity display</li><li> `obdiag gather perf` supports flame graph SVG generation</li><li> `obdiag check run` and `obdiag rca run` support HTML report output</li><li> Check Scenario Expansion, Gather Scenario Expansion </li></ul>|
+|4.2.0|2026.03| 2026.03.11 |<ul><li> Check refactor: improve SSH connection handling, add docker0 interface check</li><li> Support collecting perf information of OBProxy processes</li><li> Enhance deduplication and CREATE TABLE DDL handling in gather plan_monitor</li><li> Optimize analyze memory result style</li><li> Update obdiag command generator, ddl_disk_full and cpu_high RCA scenes </li></ul>|
 
 # Support
 
@@ -108,6 +110,25 @@ In case you have any problems when using obdiag, welcome reach out for help:
 - [Official Website](https://www.oceanbase.com/docs/obdiag-cn)
 
 # Developer
+
+## RPM builds on RHEL / CentOS 7 (EL7)
+
+Packaging `obdiag` on EL7 (for example `make pack` / `rpmbuild`) runs `pip install .[build]`, which pulls **pydantic-ai-slim** and its dependency **tiktoken** (version constraints such as `>=0.12.0`).
+
+**Why Rust may be required**
+
+- If `pip` installs a **prebuilt wheel** for `tiktoken` for your Python and platform, **no Rust toolchain is needed**.
+- If the index only serves the **source distribution** (`.tar.gz`)—which can happen with some PyPI mirrors—or resolution picks sdist, `pip` **builds `tiktoken` from source**. That build uses **Cargo** and downloads crates from **crates.io**, so a working **Rust** install and reliable access to crates matter.
+
+**What to configure on EL7 / in restricted networks**
+
+1. **Rust via rustup** (provides `rustc` / `cargo` on `PATH` when building). Follow the official install at [rustup.rs](https://rustup.rs/). If your environment cannot reach the default distribution hosts, use the mirror or proxy settings recommended by your organization.
+
+2. **Optional Cargo registry mirror** in `~/.cargo/config.toml` if downloads from `crates.io` are slow or blocked during a source build—point `crates-io` at a registry your network can reach. Ensure the file is valid TOML (normal quotes; avoid accidental escaping when the config is generated from other tools).
+
+3. **Prefer wheels when possible**: upgrade `pip` / `setuptools` / `wheel`, and optionally set `PIP_EXTRA_INDEX_URL=https://pypi.org/simple` (or ensure your PyPI mirror provides `tiktoken` wheels) so `pip` can skip compiling `tiktoken` entirely.
+
+End users who install the published RPM do **not** need Rust; this applies to **developers and CI images** that build the binary package from source.
 
 ## Join us
 Please add the OB community assistant (WeChat ID: obce666) and note "obdiag SIG", and the staff will contact you and guide you on matters related to joining SIG. We look forward to your active participation and valuable contributions!

@@ -10,6 +10,11 @@ dependencies/bin/obstack*
 obdiag_gather_pack_*
 obdiag_analyze_pack_*
 obdiag_rca*
-
+obdiag_*
 dev_doc/*
+dev_docs/
 *.md
+!plugins/**/*.md
+build/
+rpmbuild/
+.cursor/

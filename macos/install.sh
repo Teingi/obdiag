@@ -47,9 +47,10 @@ if [ -d "$INSTALL_PATH/plugins" ]; then
     cp -rf "$INSTALL_PATH/plugins/"* "$OBDIAG_HOME/"
 fi
 
-if [ -f "$INSTALL_PATH/conf/ai.yml.example" ]; then
+if [ -f "$INSTALL_PATH/conf/agent.yml.example" ]; then
     echo -e "${YELLOW}Copying configuration examples...${NC}"
-    cp -f "$INSTALL_PATH/conf/ai.yml.example" "$OBDIAG_HOME/"
+    mkdir -p "$OBDIAG_HOME/config"
+    cp -f "$INSTALL_PATH/conf/agent.yml.example" "$OBDIAG_HOME/config/"
 fi
 
 if [ -d "$INSTALL_PATH/example" ]; then
@@ -193,7 +194,7 @@ _obdiag_completion() {
                     type_list="log clog slog plan_monitor stack perf sysstat obproxy_log all scene ash tabledump parameter variable"
                     ;;
                 analyze)
-                    type_list="log flt_trace parameter variable index_space queue memory"
+                    type_list="log flt_trace parameter variable index_space queue memory sql sql_review"
                     ;;
                 rca)
                     type_list="run list"

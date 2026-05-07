@@ -190,7 +190,7 @@ class GatherDBMSXPLANHandler(SafeStdio):
 
     def get_display_cursor(self):
         result = ''
-        display_cursor_sql = "SELECT DBMS_XPLAN.DISPLAY_CURSOR({plan_id}, 'all', '{svr_ip}',  {svr_port}, {tenant_id}) FROM DUAL".format(plan_id=self.plan_id, svr_ip=self.svr_ip, svr_port=self.svr_port, tenant_id=self.tenant_id)
+        display_cursor_sql = "SELECT CONVERT(DBMS_XPLAN.DISPLAY_CURSOR({plan_id}, 'all', '{svr_ip}',  {svr_port}, {tenant_id}) USING utf8mb4) FROM DUAL".format(plan_id=self.plan_id, svr_ip=self.svr_ip, svr_port=self.svr_port, tenant_id=self.tenant_id)
         try:
             if not StringUtils.compare_versions_lower(self.version, "4.2.5.0"):
                 self.stdio.verbose("execute SQL: %s", display_cursor_sql)
@@ -278,7 +278,7 @@ class GatherDBMSXPLANHandler(SafeStdio):
             ssh_client = None
             try:
                 ssh_client = SshClient(self.context, node)
-            except Exception as e:
+            except Exception:
                 self.stdio.exception("ssh {0}@{1}: failed, Please check the node conf.".format(remote_user, remote_ip))
                 ssh_failed = True
                 resp["skip"] = True
@@ -404,7 +404,7 @@ class GatherDBMSXPLANHandler(SafeStdio):
             pack_path = tup[5]
             try:
                 format_file_size = FileUtil.size_format(num=file_size, output_str=True)
-            except:
+            except Exception:
                 format_file_size = FileUtil.size_format(num=0, output_str=True)
             summary_tab.append((node, "Error:" + tup[2] if is_err else "Completed", format_file_size, "{0} s".format(int(consume_time)), pack_path))
         return "\nGather dbms_xplan.enable_opt_trace:\n" + tabulate(summary_tab, headers=field_names, tablefmt="grid", showindex=False)

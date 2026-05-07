@@ -35,7 +35,7 @@ mkdir -p $BUILD_DIR/SOURCES/dependencies/bin
 mkdir -p ${RPM_BUILD_ROOT}/usr/bin
 mkdir -p ${RPM_BUILD_ROOT}/opt/oceanbase-diagnostic-tool
 cp -rf $SRC_DIR/src $BUILD_DIR/SOURCES/site-packages/
-pyinstaller --hidden-import=decimal -p $BUILD_DIR/SOURCES/site-packages -F src/obdiag.py
+pyinstaller --hidden-import=decimal --hidden-import=sqlgpt_parser.parser.oceanbase_parser.parser_table --copy-metadata genai_prices --copy-metadata pydantic-ai-slim --copy-metadata pydantic-ai-skills --copy-metadata pydantic --copy-metadata pydantic-core --copy-metadata pydantic-graph --copy-metadata pydantic-settings --copy-metadata openai -p $BUILD_DIR/SOURCES/site-packages -F src/obdiag.py
 rm -f obdiag.py oceanbase-diagnostic-tool.spec
 
 cd $SRC_DIR
@@ -68,9 +68,8 @@ find $SRC_DIR -name "obdiag"
 %post
 chmod -R 755 /opt/oceanbase-diagnostic-tool/*
 chown -R root:root /opt/oceanbase-diagnostic-tool/*
-find /opt/oceanbase-diagnostic-tool/obdiag -type f -exec chmod 644 {} \;
-ln -sf /opt/oceanbase-diagnostic-tool/obdiag /usr/bin/obdiag
 chmod +x /opt/oceanbase-diagnostic-tool/obdiag
+ln -sf /opt/oceanbase-diagnostic-tool/obdiag /usr/bin/obdiag
 
 cp -rf /opt/oceanbase-diagnostic-tool/init_obdiag_cmd.sh /etc/profile.d/obdiag.sh
 /opt/oceanbase-diagnostic-tool/obdiag_backup.sh
@@ -81,3 +80,4 @@ echo -e '\033[32m source /opt/oceanbase-diagnostic-tool/init.sh \n \033[0m'
 %preun
 # Clean up symbolic links before uninstall
 rm -f /usr/bin/obdiag 2>/dev/null || true
+rm -f /bin/obdiag 2>/dev/null || true

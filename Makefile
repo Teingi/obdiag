@@ -6,7 +6,7 @@ PROJECT_PATH := $(shell pwd)
 WORK_DIR := $(shell pwd)
 OBDIAG_HOME ?= $(HOME)/.obdiag
 RELEASE ?= $(shell date +%Y%m%d%H%M)
-OBDIAG_VERSION ?= 4.1.0
+OBDIAG_VERSION ?= 5.0.0
 
 # URLs for obstack downloads
 OBUTILS_AARCH64_URL := https://obbusiness-private.oss-cn-shanghai.aliyuncs.com/download-center/opensource/observer/v4.3.5_CE/oceanbase-ce-utils-4.3.5.0-100000202024123117.el7.aarch64.rpm
@@ -16,7 +16,7 @@ OBUTILS_X64_URL := https://obbusiness-private.oss-cn-shanghai.aliyuncs.com/downl
 PYTHON_MIN_MAJOR := 3
 PYTHON_MIN_MINOR := 11
 
-.PHONY: all help pack clean init format download_obstack clean_rpm check_python install_requirements copy_files backup_obdiag build_update_package
+.PHONY: all help pack clean init format download_obstack clean_rpm check_python install_requirements copy_files backup_obdiag build_update_package pack_ubuntu clean_deb
 
 # Default target
 all: help
@@ -27,9 +27,11 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  pack                 - Build RPM package"
+	@echo "  pack_ubuntu          - Build Ubuntu/Debian package (.deb)"
 	@echo "  build_update_package - Build plugins update package (data.tar + version.yaml)"
 	@echo "  clean                - Clean result files (gather/analyze packs)"
 	@echo "  clean_rpm            - Clean old RPM build data"
+	@echo "  clean_deb            - Clean old Debian build data"
 	@echo "  init                 - Initialize development environment"
 	@echo "  format               - Format code with black"
 	@echo "  download_obstack     - Download obstack tools"
@@ -51,6 +53,25 @@ pack: clean_rpm download_obstack
 
 	@echo "Build RPM package success"
 
+# Build Ubuntu/Debian package
+# Note: requires dpkg-dev package, install with: sudo apt install dpkg-dev -y
+# Alternatively use: ./ubuntu/build_ubuntu.sh
+pack_ubuntu: clean_deb download_obstack
+	@echo "Building Ubuntu/Debian package (version: $(OBDIAG_VERSION))..."
+	@command -v dpkg-deb >/dev/null 2>&1 || (echo "Error: dpkg-deb not found. Please install: sudo apt install dpkg-dev -y" && exit 1)
+	@chmod +x $(PROJECT_PATH)/ubuntu/build_ubuntu.sh
+	@$(PROJECT_PATH)/ubuntu/build_ubuntu.sh $(OBDIAG_VERSION) $(RELEASE)
+
+# Clean old Debian build data
+clean_deb:
+	@echo "Cleaning old Debian build data..."
+	@rm -rf ./build_deb ./debian/oceanbase-diagnostic-tool
+	@rm -rf ./debian/*.debhelper ./debian/*.substvars ./debian/files
+	@rm -rf ./debian/debhelper-build-stamp
+	@rm -f ../*.deb ../*.changes ../*.buildinfo ./*.deb
+	@rm -rf ./dist ./build ./src/obdiag.py
+	@echo "Clean old Debian build data success"
+
 # Build plugins update package
 build_update_package:
 	@echo "Building plugins update package..."
@@ -68,6 +89,7 @@ build_update_package:
 # Download obstack tools
 download_obstack:
 	@echo "Checking obstack..."
+	@test "$(CURDIR)" != "/" || (echo "Error: do not run make from / (rm -rf ./usr would delete the system /usr)." && exit 1)
 	@mkdir -p ./dependencies/bin
 	@if [ -f ./dependencies/bin/obstack_aarch64 ]; then \
 		echo "obstack_aarch64 exists, skip download"; \
@@ -176,7 +198,7 @@ run:
 # Run tests (placeholder)
 test:
 	@echo "Running tests..."
-	@PYTHONPATH=$(PROJECT_PATH):$$PYTHONPATH python3 -m pytest tests/ -v 2>/dev/null || echo "No tests found or pytest not installed"
+	@PYTHONPATH=$(PROJECT_PATH):$$PYTHONPATH python3 -m pytest test/ -v 2>/dev/null || echo "No tests found or pytest not installed"
 
 # Show current configuration
 info:
@@ -212,7 +234,7 @@ pack_macos:
 	@cp -f src/main.py src/obdiag.py
 	@sed -i '' "s/<B_TIME>/$$(date)/" ./src/common/version.py 2>/dev/null || sed -i "s/<B_TIME>/$$(date)/" ./src/common/version.py
 	@sed -i '' "s/<VERSION>/$(OBDIAG_VERSION)/" ./src/common/version.py 2>/dev/null || sed -i "s/<VERSION>/$(OBDIAG_VERSION)/" ./src/common/version.py
-	@pyinstaller --hidden-import=decimal --hidden-import=pyzipper -p $(PROJECT_PATH)/src -F src/obdiag.py --distpath $(PROJECT_PATH)/dist_macos
+	@pyinstaller --hidden-import=decimal --hidden-import=pyzipper --copy-metadata genai_prices --copy-metadata pydantic-ai-slim --copy-metadata pydantic-ai-skills --copy-metadata pydantic --copy-metadata pydantic-core --copy-metadata pydantic-graph --copy-metadata pydantic-settings --copy-metadata openai -p $(PROJECT_PATH)/src -F src/obdiag.py --distpath $(PROJECT_PATH)/dist_macos
 	@rm -f src/obdiag.py
 	@echo "macOS binary built: $(PROJECT_PATH)/dist_macos/obdiag"
 	@echo ""

@@ -16,17 +16,24 @@
 @desc: Base class for Python check tasks
 """
 
-import time
-import random
-import threading
+import re
 
 from src.common.command import get_observer_version, get_obproxy_version, get_obproxy_full_version
 from src.common.tool import StringUtils, Util
-from src.common.ssh_client.ssh import SshClient
 
-# Thread locks for SSH connection creation per host to avoid concurrent connection issues
-_ssh_connection_locks = {}
-_ssh_connection_locks_lock = threading.Lock()
+
+class NodeWrapper(dict):
+    """
+    Wrapper for node dict to support get_name() used by some plugins.
+
+    Delegates to ssher.get_name() when ssher exists, else falls back to node.get("ip", "unknown").
+    """
+
+    def get_name(self):
+        ssher = self.get("ssher")
+        if ssher is not None and hasattr(ssher, "get_name"):
+            return ssher.get_name()
+        return self.get("ip", "unknown")
 
 
 class TaskBase:
@@ -71,28 +78,36 @@ class TaskBase:
         # get ob_cluster
         self.ob_cluster = self.context.cluster_config
 
-        # Create independent SSH connections for this task to avoid connection contention
-        # Each task creates its own SSH connections in init to ensure thread safety
-        # Use per-host locks to prevent concurrent connection attempts to the same server
-        observer_nodes_config = self.context.cluster_config.get("servers")
-        if observer_nodes_config:
-            self.observer_nodes = []
-            for node in observer_nodes_config:
-                # Create a copy of node dict to avoid sharing between tasks
-                node_copy = node.copy()
-                ssher = self._create_ssh_connection_with_lock(node_copy)
-                node_copy["ssher"] = ssher
-                self.observer_nodes.append(node_copy)
+        # Get SSH connections from pool (shared across tasks).
+        # Only request nodes for current check_target_type to avoid pool exhaustion:
+        # obproxy tasks should not request observer nodes (and vice versa).
+        ssh_manager = self.context.get_variable("check_ssh_manager")
+        check_target_type = self.context.get_variable("check_target_type") or "observer"
 
-        obproxy_nodes_config = self.context.obproxy_config.get("servers")
-        if obproxy_nodes_config:
-            self.obproxy_nodes = []
-            for node in obproxy_nodes_config:
-                # Create a copy of node dict to avoid sharing between tasks
-                node_copy = node.copy()
-                ssher = self._create_ssh_connection_with_lock(node_copy)
-                node_copy["ssher"] = ssher
-                self.obproxy_nodes.append(node_copy)
+        if check_target_type == "observer":
+            observer_nodes_config = self.context.cluster_config.get("servers")
+            if observer_nodes_config:
+                self.observer_nodes = []
+                for node in observer_nodes_config:
+                    node_copy = NodeWrapper(node.copy())
+                    ssher = ssh_manager.get_connection(node) if ssh_manager else None
+                    node_copy["ssher"] = ssher
+                    self.observer_nodes.append(node_copy)
+            else:
+                self.observer_nodes = []
+
+        if check_target_type == "obproxy":
+            obproxy_config = self.context.obproxy_config or {}
+            obproxy_nodes_config = obproxy_config.get("servers")
+            if obproxy_nodes_config:
+                self.obproxy_nodes = []
+                for node in obproxy_nodes_config:
+                    node_copy = NodeWrapper(node.copy())
+                    ssher = ssh_manager.get_connection(node) if ssh_manager else None
+                    node_copy["ssher"] = ssher
+                    self.obproxy_nodes.append(node_copy)
+            else:
+                self.obproxy_nodes = []
 
         # Check if this is build_before case (should not create DB connection or get version)
         cases_option = Util.get_option(self.context.options, 'cases')
@@ -104,7 +119,10 @@ class TaskBase:
             self.observer_version = None
             self.stdio.verbose("cases is build_before, skip getting observer version")
         else:
-            self.observer_version = self.context.cluster_config.get("version", "")
+            # Prefer context cache, then cluster_config, then query
+            self.observer_version = self.context.get_variable("check_observer_version") or ""
+            if not self.observer_version:
+                self.observer_version = self.context.cluster_config.get("version", "")
             if not self.observer_version:
                 try:
                     self.observer_version = get_observer_version(self.context)
@@ -127,95 +145,62 @@ class TaskBase:
             # Fallback: create new connector if pool not available
             from src.common.ob_connector import OBConnector
 
+            tenant_sys = self.ob_cluster.get("tenant_sys") or {}
             self.ob_connector = OBConnector(
                 context=self.context,
                 ip=self.ob_cluster.get("db_host"),
                 port=self.ob_cluster.get("db_port"),
-                username=self.ob_cluster.get("tenant_sys").get("user"),
-                password=self.ob_cluster.get("tenant_sys").get("password"),
+                username=tenant_sys.get("user"),
+                password=tenant_sys.get("password"),
                 timeout=10000,
             )
             self._using_pool_connection = False
 
         # get obproxy version (only once, reuse if available)
-        if self.obproxy_nodes is None or len(self.obproxy_nodes) == 0:
-            self.stdio.verbose("obproxy_nodes is None. So set obproxy_version and obproxy_full_version to None")
-        else:
-            try:
-                self.obproxy_version = get_obproxy_version(self.context)
-            except Exception as e:
-                self.stdio.error("get obproxy_version fail: {0}".format(e))
-            try:
-                self.obproxy_full_version = get_obproxy_full_version(self.context)
-            except Exception as e:
-                self.stdio.error("get obproxy_full_version fail: {0}".format(e))
-
-    def _create_ssh_connection_with_lock(self, node):
-        """
-        Create SSH connection with per-host locking to avoid concurrent connection issues.
-
-        Args:
-            node: Node configuration dict
-
-        Returns:
-            SshClient instance or None if connection failed
-        """
-        host_ip = node.get("ip")
-        if not host_ip:
-            return None
-
-        # Get or create a lock for this specific host
-        with _ssh_connection_locks_lock:
-            if host_ip not in _ssh_connection_locks:
-                _ssh_connection_locks[host_ip] = threading.Lock()
-            host_lock = _ssh_connection_locks[host_ip]
-
-        # Use per-host lock to serialize connection attempts
-        with host_lock:
-            # Add small random delay to avoid thundering herd
-            time.sleep(random.uniform(0.01, 0.1))
-
-            ssher = None
-            try:
-                ssher = SshClient(self.context, node)
-                self.stdio.verbose("SSH connection created for {0}".format(host_ip))
-            except Exception as e:
-                self.stdio.warn("Task SSH connection failed on {0}, Exception: {1}".format(host_ip, e))
-            return ssher
+        if check_target_type == "obproxy":
+            if self.obproxy_nodes is None or len(self.obproxy_nodes) == 0:
+                self.stdio.verbose("obproxy_nodes is None. So set obproxy_version and obproxy_full_version to None")
+            else:
+                # Prefer context cache (set by parent before task dispatch), then query
+                self.obproxy_version = self.context.get_variable("check_obproxy_version") or ""
+                if not self.obproxy_version:
+                    try:
+                        self.obproxy_version = get_obproxy_version(self.context)
+                    except Exception as e:
+                        self.stdio.error("get obproxy_version fail: {0}".format(e))
+                # Prefer context cache for full_version too
+                self.obproxy_full_version = self.context.get_variable("check_obproxy_full_version") or ""
+                if not self.obproxy_full_version:
+                    try:
+                        self.obproxy_full_version = get_obproxy_full_version(self.context)
+                    except Exception as e:
+                        self.stdio.error("get obproxy_full_version fail: {0}".format(e))
 
     def cleanup(self):
         """
         Cleanup resources after task execution.
-        Release connection back to pool if using pooled connection.
-        Close SSH connections created for this task.
+        Release DB and SSH connections back to their pools.
         """
         # Release database connection back to pool
-        if hasattr(self, '_using_pool_connection') and self._using_pool_connection:
-            ob_connector_pool = self.context.get_variable('check_obConnector_pool')
+        if hasattr(self, "_using_pool_connection") and self._using_pool_connection:
+            ob_connector_pool = self.context.get_variable("check_obConnector_pool")
             if ob_connector_pool and self.ob_connector:
                 ob_connector_pool.release_connection(self.ob_connector)
                 self.ob_connector = None
 
-        # Close SSH connections created for this task
-        if hasattr(self, 'observer_nodes') and self.observer_nodes:
-            for node in self.observer_nodes:
-                ssher = node.get("ssher")
-                if ssher and hasattr(ssher, 'client') and ssher.client:
-                    try:
-                        if hasattr(ssher.client, '_ssh_fd') and ssher.client._ssh_fd:
-                            ssher.client._ssh_fd.close()
-                    except Exception as e:
-                        self.stdio.verbose("Failed to close SSH connection for {0}: {1}".format(node.get("ip"), e))
-
-        if hasattr(self, 'obproxy_nodes') and self.obproxy_nodes:
-            for node in self.obproxy_nodes:
-                ssher = node.get("ssher")
-                if ssher and hasattr(ssher, 'client') and ssher.client:
-                    try:
-                        if hasattr(ssher.client, '_ssh_fd') and ssher.client._ssh_fd:
-                            ssher.client._ssh_fd.close()
-                    except Exception as e:
-                        self.stdio.verbose("Failed to close SSH connection for {0}: {1}".format(node.get("ip"), e))
+        # Release SSH connections back to pool (do not close, they are reused)
+        ssh_manager = self.context.get_variable("check_ssh_manager")
+        if ssh_manager:
+            if hasattr(self, "observer_nodes") and self.observer_nodes:
+                for node in self.observer_nodes:
+                    ssher = node.get("ssher")
+                    if ssher:
+                        ssh_manager.release_connection(ssher)
+            if hasattr(self, "obproxy_nodes") and self.obproxy_nodes:
+                for node in self.obproxy_nodes:
+                    ssher = node.get("ssher")
+                    if ssher:
+                        ssh_manager.release_connection(ssher)
 
     def execute(self):
         """
@@ -266,10 +251,7 @@ class TaskBase:
             return False
         if self.observer_version == min_version:
             return True
-        if StringUtils.compare_versions_greater(self.observer_version, min_version):
-            return True
-        else:
-            return False
+        return StringUtils.compare_versions_greater(self.observer_version, min_version)
 
     def check_obproxy_version_min(self, min_version: str) -> bool:
         """
@@ -285,10 +267,7 @@ class TaskBase:
             return False
         if self.obproxy_version == min_version:
             return True
-        if StringUtils.compare_versions_greater(self.obproxy_version, min_version):
-            return True
-        else:
-            return False
+        return StringUtils.compare_versions_greater(self.obproxy_version, min_version)
 
     def check_ob_version_max(self, max_version: str) -> bool:
         """
@@ -304,21 +283,21 @@ class TaskBase:
             return False
         if self.observer_version == max_version:
             return True
-        if StringUtils.compare_versions_greater(max_version, self.observer_version):
-            return True
-        else:
-            return False
+        return StringUtils.compare_versions_greater(max_version, self.observer_version)
 
     def get_obproxy_parameter(self, parameter_name: str) -> list:
         """
         Get obproxy parameter value.
 
         Args:
-            parameter_name: Name of the parameter to query
+            parameter_name: Name of the parameter to query (must match ^[\\w.]+$)
 
         Returns:
             list: Parameter data from query result
         """
+        if not re.match(r'^[\w.]+$', parameter_name):
+            self.stdio.error("invalid parameter_name '{0}': only word characters and dots are allowed".format(parameter_name))
+            return []
         try:
             sql = "show proxyconfig like '{0}';".format(parameter_name)
             data = self.ob_connector.execute_sql_return_cursor_dictionary(sql).fetchall()
@@ -333,12 +312,15 @@ class TaskBase:
 
         Args:
             ssh_client: SSH client instance
-            command: Command to check
+            command: Command to check (must contain only word characters and hyphens)
 
         Returns:
             bool: True if command exists
         """
         if ssh_client is None:
+            return False
+        if not re.match(r'^[\w.\-]+$', command):
+            self.stdio.error("invalid command name '{0}': only word characters, dots and hyphens are allowed".format(command))
             return False
         try:
             result = ssh_client.exec_cmd("command -v " + command)
@@ -359,6 +341,8 @@ class TaskBase:
         Returns:
             str: 'linux', 'darwin' (macOS), or 'unknown'
         """
+        if ssh_client is None:
+            return "unknown"
         try:
             result = ssh_client.exec_cmd("uname -s").strip().lower()
             if "linux" in result:
@@ -391,8 +375,15 @@ class TaskBase:
         Returns:
             str: Parameter value or None if not found
         """
+        if ssh_client is None:
+            return None
         try:
             os_type = self.get_os_type(ssh_client)
+
+            # Validate parameter_name before any branch to prevent shell injection
+            if not re.match(r'^[\w.\-]+$', parameter_name):
+                self.stdio.error("invalid parameter_name '{0}': only word characters, dots and hyphens are allowed".format(parameter_name))
+                return None
 
             if os_type == "darwin":
                 # macOS: use sysctl command
@@ -411,9 +402,9 @@ class TaskBase:
             else:
                 # Linux: use /proc/sys/
                 proc_path = parameter_name.replace(".", "/")
-                # check parameter_name exists
-                if ssh_client.exec_cmd('find /proc/sys/ -name "{0}"'.format(proc_path.split("/")[-1])) == "":
-                    self.stdio.warn("{0} is not exist".format(parameter_name))
+                check_result = ssh_client.exec_cmd("test -f /proc/sys/{0} && echo exists".format(proc_path))
+                if "exists" not in (check_result or ""):
+                    self.stdio.warn("{0} does not exist".format(parameter_name))
                     return None
                 parameter_value = ssh_client.exec_cmd("cat /proc/sys/" + proc_path).strip()
                 return parameter_value

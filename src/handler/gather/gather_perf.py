@@ -25,7 +25,7 @@ import datetime
 
 import tabulate
 
-from src.common.command import get_observer_pid, mkdir, zip_dir, get_file_size, download_file, delete_file_force, is_empty_dir, is_empty_file
+from src.common.command import get_observer_pid, get_obproxy_pid, mkdir, get_file_size, download_file, delete_file_force, is_empty_file
 from src.common.command import SshClient
 from src.common.constant import const
 from src.handler.base_shell_handler import BaseShellHandler
@@ -127,6 +127,22 @@ class GatherPerfHandler(BaseShellHandler):
                     continue
                 handle_from_node(node)
                 exec_tag = True
+            # When obproxy config exists, collect obproxy perf
+            obproxy_config = getattr(self.context, 'obproxy_config', None)
+            obproxy_nodes = obproxy_config.get("servers") if obproxy_config else None
+            if obproxy_nodes:
+                obproxy_nodes = Util.get_nodes_list(self.context, obproxy_nodes, self.stdio) or obproxy_nodes
+                for node in obproxy_nodes:
+                    if node.get("ssh_type") == "docker" or node.get("ssh_type") == "kubernetes":
+                        self.stdio.warn("Skip gather obproxy perf from node {0} because it is a docker or kubernetes node".format(node.get("ip")))
+                        continue
+                    st = time.time()
+                    resp = self.__handle_from_node_obproxy(node, pack_dir_this_command)
+                    file_size = ""
+                    if len(resp["error"]) == 0:
+                        file_size = os.path.getsize(resp["gather_pack_path"])
+                    gather_tuples.append((node.get("ip") + "(obproxy)", False, resp["error"], file_size, int(time.time() - st), resp["gather_pack_path"]))
+                    exec_tag = True
         else:
             local_ip = NetUtils.get_inner_ip(self.stdio)
             node = self.nodes[0]
@@ -141,7 +157,6 @@ class GatherPerfHandler(BaseShellHandler):
         self.stdio.print(summary_tuples)
         # Persist the summary results to a file
         FileUtil.write_append(os.path.join(pack_dir_this_command, "result_summary.txt"), summary_tuples)
-        last_info = "For result details, please run cmd \033[32m' cat {0} '\033[0m\n".format(os.path.join(pack_dir_this_command, "result_summary.txt"))
         return ObdiagResult(ObdiagResult.SUCCESS_CODE, data={"store_dir": pack_dir_this_command})
 
     def __handle_from_node(self, node, local_stored_path):
@@ -157,7 +172,7 @@ class GatherPerfHandler(BaseShellHandler):
         ssh_client = None
         try:
             ssh_client = SshClient(self.context, node)
-        except Exception as e:
+        except Exception:
             self.stdio.exception("ssh {0}@{1}: failed, Please check the node conf.".format(remote_user, remote_ip))
             ssh_failed = True
             resp["skip"] = True
@@ -179,6 +194,61 @@ class GatherPerfHandler(BaseShellHandler):
                         self.__gather_perf_sample(ssh_client, remote_dir_full_path, pid_observer)
                         self.__gather_perf_flame(ssh_client, remote_dir_full_path, pid_observer)
                 self.__gather_top(ssh_client, remote_dir_full_path, pid_observer)
+
+            tar_cmd = "cd /tmp && tar -czf {0}.tar.gz {0}/*".format(remote_dir_name)
+            tar_cmd_request = ssh_client.exec_cmd(tar_cmd)
+            self.stdio.verbose("tar request is {0}".format(tar_cmd_request))
+            remote_tar_file_path = "{0}.tar.gz".format(remote_dir_full_path)
+            file_size = get_file_size(ssh_client, remote_tar_file_path, self.stdio)
+            remote_tar_full_path = os.path.join("/tmp", remote_tar_file_path)
+            if int(file_size) < self.file_size_limit:
+                local_file_path = "{0}/{1}.tar.gz".format(local_stored_path, remote_dir_name)
+                download_file(ssh_client, remote_tar_full_path, local_file_path, self.stdio)
+                self.__generate_flame_graph_svg(local_file_path, remote_dir_name, local_stored_path)
+                resp["error"] = ""
+            else:
+                resp["error"] = "File too large"
+            delete_file_force(ssh_client, remote_tar_full_path, self.stdio)
+            resp["gather_pack_path"] = "{0}/{1}.tar.gz".format(local_stored_path, remote_dir_name)
+        return resp
+
+    def __handle_from_node_obproxy(self, node, local_stored_path):
+        """Gather perf for obproxy process on the given node."""
+        resp = {"skip": False, "error": "", "gather_pack_path": ""}
+        remote_ip = node.get("ip") if self.is_ssh else NetUtils.get_inner_ip(self.stdio)
+        remote_user = node.get("ssh_username")
+        self.stdio.verbose("Sending Collect OBProxy Perf Shell Command to node {0} ...".format(remote_ip))
+        DirectoryUtil.mkdir(path=local_stored_path, stdio=self.stdio)
+        now_time = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        remote_dir_name = "perf_obproxy_{0}_{1}".format(node.get("ip").replace(":", "_"), now_time)
+        remote_dir_full_path = "/tmp/{0}".format(remote_dir_name)
+        ssh_failed = False
+        ssh_client = None
+        try:
+            ssh_client = SshClient(self.context, node)
+        except Exception:
+            self.stdio.exception("ssh {0}@{1}: failed, Please check the node conf.".format(remote_user, remote_ip))
+            ssh_failed = True
+            resp["skip"] = True
+            resp["error"] = "Please check the node conf."
+            return resp
+        if not ssh_failed:
+            mkdir(ssh_client, remote_dir_full_path, self.stdio)
+            home_path = node.get("home_path") or const.OBPROXY_INSTALL_DIR_DEFAULT
+            pid_obproxy_list = get_obproxy_pid(ssh_client, home_path, self.stdio)
+            if len(pid_obproxy_list) == 0:
+                resp["error"] = "can't find obproxy"
+                return resp
+            for pid_obproxy in pid_obproxy_list:
+                if self.__perf_checker(ssh_client):
+                    if self.scope == "sample":
+                        self.__gather_perf_sample(ssh_client, remote_dir_full_path, pid_obproxy)
+                    elif self.scope == "flame":
+                        self.__gather_perf_flame(ssh_client, remote_dir_full_path, pid_obproxy)
+                    else:
+                        self.__gather_perf_sample(ssh_client, remote_dir_full_path, pid_obproxy)
+                        self.__gather_perf_flame(ssh_client, remote_dir_full_path, pid_obproxy)
+                self.__gather_top(ssh_client, remote_dir_full_path, pid_obproxy)
 
             tar_cmd = "cd /tmp && tar -czf {0}.tar.gz {0}/*".format(remote_dir_name)
             tar_cmd_request = ssh_client.exec_cmd(tar_cmd)
@@ -287,13 +357,25 @@ class GatherPerfHandler(BaseShellHandler):
             cmd = "cd {gather_path} && perf record -o sample.data -e cycles -c {count_option} -p {pid} -g -- sleep 20".format(gather_path=gather_path, count_option=self.count_option, pid=pid_observer)
             self.stdio.verbose("gather perf sample, run cmd = [{0}]".format(cmd))
             ssh_client.exec_cmd(cmd)
+            # Verify sample.data exists and has content before running perf script
+            sample_data_path = os.path.join(gather_path, 'sample.data')
+            try:
+                sample_size = get_file_size(ssh_client, sample_data_path, self.stdio)
+                sample_size_int = int(sample_size) if sample_size else 0
+            except (ValueError, TypeError):
+                sample_size_int = 0
+            if sample_size_int == 0:
+                self.stdio.error(
+                    "perf record produced empty sample.data on server [{0}]. " "Possible causes: 1) Permission denied (run as root or set kernel.perf_event_paranoid=-1); " "2) count too high for 20s (try --count 1000000)".format(ssh_client.get_name())
+                )
+                raise Exception("perf record produced empty output")
             generate_data = "cd {gather_path} && perf script -i sample.data -F ip,sym -f > sample.viz".format(gather_path=gather_path)
             self.stdio.verbose("generate perf sample data, run cmd = [{0}]".format(generate_data))
             ssh_client.exec_cmd(generate_data)
             self.is_ready(ssh_client, os.path.join(gather_path, 'sample.viz'))
             self.stdio.stop_loading('gather perf sample')
-        except:
-            self.stdio.error("generate perf sample data on server [{0}] failed".format(ssh_client.get_name()))
+        except Exception as e:
+            self.stdio.error("generate perf sample data on server [{0}] failed: {1}".format(ssh_client.get_name(), e))
 
     def __perf_checker(self, ssh_client):
         cmd = "command -v perf"
@@ -312,21 +394,29 @@ class GatherPerfHandler(BaseShellHandler):
             perf_cmd = "cd {gather_path} && perf record -o flame.data -F 99 -p {pid} -g -- sleep 20".format(gather_path=gather_path, pid=pid_observer)
             self.stdio.verbose("gather perf, run cmd = [{0}]".format(perf_cmd))
             ssh_client.exec_cmd(perf_cmd)
-
+            flame_data_path = os.path.join(gather_path, 'flame.data')
+            try:
+                flame_size = get_file_size(ssh_client, flame_data_path, self.stdio)
+                flame_size_int = int(flame_size) if flame_size else 0
+            except (ValueError, TypeError):
+                flame_size_int = 0
+            if flame_size_int == 0:
+                self.stdio.error("perf record produced empty flame.data on server [{0}]. " "Possible causes: Permission denied (run as root or set kernel.perf_event_paranoid=-1)".format(ssh_client.get_name()))
+                raise Exception("perf record produced empty output")
             generate_data = "cd {gather_path} && perf script -i flame.data > flame.viz".format(gather_path=gather_path)
             self.stdio.verbose("generate perf data, run cmd = [{0}]".format(generate_data))
             ssh_client.exec_cmd(generate_data)
             self.is_ready(ssh_client, os.path.join(gather_path, 'flame.viz'))
             self.stdio.stop_loading('gather perf flame')
-        except:
-            self.stdio.error("generate perf data on server [{0}] failed".format(ssh_client.get_name()))
+        except Exception as e:
+            self.stdio.error("generate perf data on server [{0}] failed: {1}".format(ssh_client.get_name(), e))
 
     def __gather_top(self, ssh_client, gather_path, pid_observer):
         try:
             cmd = "cd {gather_path} && top -Hp {pid} -b -n 1 > top.txt".format(gather_path=gather_path, pid=pid_observer)
             self.stdio.verbose("gather top, run cmd = [{0}]".format(cmd))
             ssh_client.exec_cmd(cmd)
-        except:
+        except Exception:
             self.stdio.error("gather top on server failed [{0}]".format(ssh_client.get_name()))
 
     @Util.retry(3, 5)
@@ -335,7 +425,7 @@ class GatherPerfHandler(BaseShellHandler):
             self.stdio.verbose("check whether the file {remote_path} is empty".format(remote_path=remote_path))
             is_empty_file_res = is_empty_file(ssh_client, remote_path, self.stdio)
             if is_empty_file_res:
-                self.stdio.warn("The server {host_ip} directory {remote_path} is empty, waiting for the collection to complete".format(host_ip=ssh_client.get_name(), remote_path=remote_path))
+                self.stdio.warn("The server {host_ip} file {remote_path} is empty, waiting for the collection to complete".format(host_ip=ssh_client.get_name(), remote_path=remote_path))
                 raise
         except Exception as e:
             raise e
@@ -352,7 +442,7 @@ class GatherPerfHandler(BaseShellHandler):
             pack_path = tup[5]
             try:
                 format_file_size = FileUtil.size_format(num=file_size, output_str=True)
-            except:
+            except Exception:
                 format_file_size = FileUtil.size_format(num=0, output_str=True)
             summary_tab.append((node, "Error:" + tup[2] if is_err else "Completed", format_file_size, "{0} s".format(int(consume_time)), pack_path))
         return "\nGather Perf Summary:\n" + tabulate.tabulate(summary_tab, headers=field_names, tablefmt="grid", showindex=False)

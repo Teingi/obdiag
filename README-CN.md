@@ -94,7 +94,9 @@ obdiag 期望构建一个开放的社区，我们欢迎任何形式的贡献，�
 |3.7.0|2025.08| 2025.09.09 |<ul><li> obdiag-mcp 新增 pip 安装方式(pip install obdiag-mcp) </li><li> 巡检场景扩展 </li></ul>|
 |3.7.1|2025.09| 2025.10.22 |<ul><li> 巡检场景扩展 </li></ul>|
 |3.7.2|2025.10| 2025.11.27 |<ul><li> 巡检场景扩展 </li></ul>|
-|4.0.0|2025.12| 2026.01.07 |<ul><li> 新增 `obdiag tool ai_assistant` 命令，AI 智能诊断助手（BETA）</li><li> 新增 `obdiag tool io_performance` 命令，磁盘 IO 性能检测工具</li><li> 新增 `obdiag tool config_check` 命令，配置校验工具</li><li> 新增 `obdiag display scene run --scene=observer.compaction` 命令，合并状态展示场景</li><li> 根因分析场景扩展 </li></ul>|
+|4.0.0|2025.12| 2026.01.07 |<ul><li> 新增 `obdiag agent` 命令，智能诊断 agent（BETA）</li><li> 新增 `obdiag tool io_performance` 命令，磁盘 IO 性能检测工具</li><li> 新增 `obdiag tool config_check` 命令，配置校验工具</li><li> 新增 `obdiag display scene run --scene=observer.compaction` 命令，合并状态展示场景</li><li> 根因分析场景扩展 </li></ul>|
+|4.1.0|2026.02| 2026.02.11 |<ul><li> 依赖管理迁移至 pyproject.toml</li><li> 新增 `obdiag display-trace` 命令，便于排查命令执行问题</li><li> 新增 `obdiag display scene run --scene=observer.log_volume_statistics`，CLOG 日志量/容量统计</li><li> `obdiag gather perf` 支持火焰图 SVG 生成</li><li> `obdiag check run`、`obdiag rca run` 支持 HTML 报告输出</li><li> 巡检场景扩展、采集场景扩展 </li></ul>|
+|4.2.0|2026.03| 2026.03.11 |<ul><li> 巡检重构：优化 SSH 连接处理，新增 docker0 网卡检查</li><li> 支持采集 OBProxy 进程 perf 信息</li><li> gather plan_monitor 增强去重与 CREATE TABLE DDL 处理</li><li> 优化 analyze memory 结果展示</li><li> 更新 obdiag 命令生成器，ddl_disk_full、cpu_high RCA 场景更新 </li></ul>|
 
 # 支持
 
@@ -104,6 +106,25 @@ obdiag 期望构建一个开放的社区，我们欢迎任何形式的贡献，�
 - [官方网站](https://www.oceanbase.com/docs/obdiag-cn)
 
 # 开发者专区
+
+## 在 EL7 上打 RPM：Rust 与 Cargo
+
+在 RHEL / CentOS 7 等环境执行 **`make pack` / `rpmbuild` 打 RPM** 时，`%install` 会执行 `pip install .[build]`，依赖链中会引入 **pydantic-ai-slim**，并进一步依赖 **tiktoken**（例如版本要求 `>=0.12.0`）。
+
+**为何可能要装 Rust**
+
+- 若 `pip` 能安装到当前 Python、当前平台对应的 **tiktoken 预编译 wheel**，则**不需要**本机安装 Rust。
+- 若镜像源只提供 **源码包（sdist）** 或解析结果走了源码安装，`pip` 会**本地编译** tiktoken；该过程依赖 **Cargo**，并从 **crates.io** 拉取 crate。此时必须安装 **Rust 工具链**；若访问 crates 较慢或失败，可为 Cargo 配置可用的 registry 镜像。
+
+**EL7 / 受限网络下的建议**
+
+1. **用 rustup 安装 Rust**（提供 `rustc`、`cargo`），参见官方 [rustup.rs](https://rustup.rs/)。若默认分发地址不可达，按所在环境的镜像或代理策略配置。
+
+2. **可选：Cargo 源**：在 `~/.cargo/config.toml` 中为 `crates-io` 指向当前网络可访问的 registry，避免源码构建时长时间拉取 `crates.io` 失败。注意 TOML 引号书写正确，避免被上层工具错误转义。
+
+3. **尽量用 wheel**：升级 `pip` / `setuptools` / `wheel`，必要时增加 `PIP_EXTRA_INDEX_URL=https://pypi.org/simple`（或确保所用 PyPI 源已提供 tiktoken 的 whl），以尽量避免从源码编译 tiktoken。
+
+使用官方发布的 RPM 的**最终用户无需安装 Rust**；上述内容面向**从源码打包的开发者与 CI 镜像**。
 
 ## 加入我们
 请添加 OB社区小助手（微信号：obce666）并备注“obdiag SIG”，工作人员会联系并指引您加入 SIG 的相关事宜。期待您的积极参与与宝贵贡献！

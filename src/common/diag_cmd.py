@@ -261,7 +261,6 @@ class ObdiagOriginCommand(BaseCommand):
     def do_command(self):
         self.parse_command()
         self.start_check()
-        trace_id = uuid()
         ret = False
         try:
             log_directory = os.path.join(os.path.expanduser("~"), ".obdiag", "log")
@@ -291,12 +290,10 @@ class ObdiagOriginCommand(BaseCommand):
             ret = None
             try:
                 ret = self._do_command(obdiag)
-                exit_code = 0
             except Exception as e:
                 ROOT_IO.exception(e)
                 ROOT_IO.error('command failed. Please contact OceanBase community. e: {0}'.format(e))
                 ret = ObdiagResult(code=ObdiagResult.SERVER_ERROR_CODE, error_data="command failed. Please contact OceanBase community. e: {0}".format(e))
-                exit_code = 1
             # if silent is true ,print ret
             if ROOT_IO.silent:
                 if isinstance(ret, ObdiagResult) is False:
@@ -338,7 +335,7 @@ class ObdiagOriginCommand(BaseCommand):
             pass
         except KeyboardInterrupt:
             ROOT_IO.exception('Keyboard Interrupt')
-        except:
+        except Exception:
             e = sys.exc_info()[1]
             ROOT_IO.exception('Running Error: %s' % e)
 
@@ -377,7 +374,7 @@ class DisplayTraceCommand(ObdiagOriginCommand):
             if UUID(trace_id).version != 1:
                 ROOT_IO.critical('%s is not trace id' % trace_id)
                 return False
-        except:
+        except (ValueError, AttributeError):
             ROOT_IO.print('%s is not trace id' % trace_id)
             return False
         cmd = 'cd {} && grep -h "\[{}\]" $(ls -tr {}*) | sed "s/\[{}\] //g" '.format(log_dir, trace_id, log_dir, trace_id)
@@ -1065,17 +1062,17 @@ class ObdiagAnalyzeSQLCommand(ObdiagOriginCommand):
     def __init__(self):
         super(ObdiagAnalyzeSQLCommand, self).__init__('sql', 'Analyze OceanBase sql from sql_audit ')
         self.parser.add_option('--tenant_name', type='string', help="tenant name")
-        self.parser.add_option('--host', type='string', help="tenant connection host")
-        self.parser.add_option('--port', type='string', help="tenant connection port")
+        self.parser.add_option('--host', type='string', help="with --user: endpoint host for sql_audit (default: obcluster db_host; sys/meta still use config)")
+        self.parser.add_option('--port', type='string', help="with --user: endpoint port for sql_audit (default: obcluster db_port)")
         self.parser.add_option('--password', type='string', help="tenant connection user password", default='')
-        self.parser.add_option('--user', type='string', help="tenant connection user name")
+        self.parser.add_option('--user', type='string', help="business tenant user: user@tenant, user@tenant#cluster, or cluster:tenant:user (required format when set)")
         self.parser.add_option('--from', type='string', help="specify the start of the time range. format: 'yyyy-mm-dd hh:mm:ss'")
         self.parser.add_option('--to', type='string', help="specify the end of the time range. format: 'yyyy-mm-dd hh:mm:ss'")
         self.parser.add_option('--since', type='string', help="Specify time range that from 'n' [d]ays, 'n' [h]ours or 'n' [m]inutes. before to now. format: <n> <m|h|d>. example: 1h.", default='30m')
         self.parser.add_option('--level', type='string', help="The alarm level, optional parameters [critical, warn, notice, ok]", default='notice')
         self.parser.add_option('--output', type='string', help="The format of the output results, choices=[json, html]", default='html')
         self.parser.add_option('--limit', type='string', help="The limit on the number of data rows returned by sql_audit for the tenant.", default=2000)
-        self.parser.add_option('--store_dir', type='string', help='the dir to store result, current dir by default.', default='./obdiag_analyze/')
+        self.parser.add_option('--store_dir', type='string', help='parent directory for this run; each execution creates obdiag_analyze_sql_* under it (default: current directory).', default='.')
         self.parser.add_option('--elapsed_time', type='string', help='The minimum threshold for filtering execution time, measured in microseconds.', default=100000)
         self.parser.add_option('-c', type='string', help='obdiag custom config', default=os.path.expanduser('~/.obdiag/config.yml'))
         self.parser.add_option('--config', action="append", type="string", help='config options Format: --config key=value')
@@ -1093,14 +1090,15 @@ class ObdiagAnalyzeSQLReviewCommand(ObdiagOriginCommand):
 
     def __init__(self):
         super(ObdiagAnalyzeSQLReviewCommand, self).__init__('sql_review', 'Analyze OceanBase sql from file')
-        self.parser.add_option('--host', type='string', help="tenant connection host")
-        self.parser.add_option('--port', type='string', help="tenant connection port")
+        self.parser.add_option('--host', type='string', help="with --user: MySQL endpoint host (default: obcluster db_host)")
+        self.parser.add_option('--port', type='string', help="with --user: MySQL endpoint port (default: obcluster db_port)")
         self.parser.add_option('--password', type='string', help="tenant connection user password", default='')
-        self.parser.add_option('--user', type='string', help="tenant connection user name")
+        self.parser.add_option('--user', type='string', help="when set: user@tenant, user@tenant#cluster, or cluster:tenant:user (same rules as analyze sql)")
+        self.parser.add_option('--tenant_name', type='string', help="tenant name (optional; for future use with DB-backed review)")
         self.parser.add_option('--files', type='string', action="append", help="specify files")
         self.parser.add_option('--level', type='string', help="The alarm level, optional parameters [critical, warn, notice, ok]", default='notice')
         self.parser.add_option('--output', type='string', help="The format of the output results, choices=[json, html]", default='html')
-        self.parser.add_option('--store_dir', type='string', help='the dir to store result, current dir by default.', default='./obdiag_analyze/')
+        self.parser.add_option('--store_dir', type='string', help='parent directory for this run; each execution creates obdiag_sql_review_* under it (default: current directory).', default='.')
         self.parser.add_option('-c', type='string', help='obdiag custom config', default=os.path.expanduser('~/.obdiag/config.yml'))
         self.parser.add_option('--config', action="append", type="string", help='config options Format: --config key=value')
 
@@ -1175,7 +1173,7 @@ class ObdiagRCARunCommand(ObdiagOriginCommand):
             try:
                 self.scene_input_param_map = json.loads(value)
                 return
-            except Exception as e:
+            except Exception:
                 ROOT_IO.verbose("env option {0} is not json.".format(value))
 
             # env option is key=val format
@@ -1314,20 +1312,30 @@ class ObdiagToolIoPerformanceCommand(ObdiagOriginCommand):
         return obdiag.tool_io_performance(self.opts)
 
 
-class ObdiagToolAiAssistantCommand(ObdiagOriginCommand):
+class ObdiagAgentCommand(ObdiagOriginCommand):
 
     def __init__(self):
-        super(ObdiagToolAiAssistantCommand, self).__init__('ai_assistant', 'obdiag tool ai_assistant. Interactive AI assistant for obdiag diagnostic (BETA)')
+        super(ObdiagAgentCommand, self).__init__('agent', 'obdiag agent. Interactive diagnostic agent for obdiag (BETA)')
         self.parser.add_option('-c', type='string', help='obdiag custom config', default=os.path.expanduser('~/.obdiag/config.yml'))
         self.parser.add_option('--config', action="append", type="string", help='config options Format: --config key=value')
+        self.parser.add_option('-m', '--message', type='string', help='single-shot message to send to the agent', default=None)
+        self.parser.add_option('--resume', type='string', help='resume a previous session by ID (see "sessions" command)', default=None)
+        self.parser.add_option('-y', '--yolo', action='store_true', dest='yolo', help='auto-approve all tools (for testing with -m)', default=False)
 
     def init(self, cmd, args):
-        super(ObdiagToolAiAssistantCommand, self).init(cmd, args)
-        self.parser.set_usage('%s [options]' % self.prev_cmd)
+        super(ObdiagAgentCommand, self).init(cmd, args)
+        self.parser.set_usage(
+            '%s [options]\n\n'
+            '  Interactive mode:   obdiag agent\n'
+            '  Single-shot mode:   obdiag agent -m "帮我巡检一下集群"\n'
+            '  Resume session:     obdiag agent --resume 20260313_142055\n'
+            '  Resume + message:   obdiag agent --resume 20260313_142055 -m "这些文件有多大"  (for testing)\n'
+            '  Target cluster:     obdiag agent -c obdiag_test' % self.prev_cmd
+        )
         return self
 
     def _do_command(self, obdiag):
-        return obdiag.tool_ai_assistant(self.opts)
+        return obdiag.agent(self.opts)
 
 
 class ObdiagToolConfigCheckCommand(ObdiagOriginCommand):
@@ -1344,6 +1352,27 @@ class ObdiagToolConfigCheckCommand(ObdiagOriginCommand):
 
     def _do_command(self, obdiag):
         return obdiag.tool_config_check(self.opts)
+
+
+class ObdiagToolSqlSyntaxCommand(ObdiagOriginCommand):
+
+    def __init__(self):
+        super(ObdiagToolSqlSyntaxCommand, self).__init__(
+            'sql_syntax',
+            'obdiag tool sql_syntax. Validate SQL against a live OceanBase instance using EXPLAIN (no execution of the original statement)',
+        )
+        self.parser.add_option('--sql', type='string', help='SQL statement to validate (single statement only)')
+        self.parser.add_option('--env', action='append', type='string', help='Connection override: --env key=value (host, port, user, password/pwd, database/db)')
+        self.parser.add_option('-c', type='string', help='obdiag custom config', default=os.path.expanduser('~/.obdiag/config.yml'))
+        self.parser.add_option('--config', action='append', type='string', help='config options Format: --config key=value')
+
+    def init(self, cmd, args):
+        super(ObdiagToolSqlSyntaxCommand, self).init(cmd, args)
+        self.parser.set_usage('%s [options]' % self.prev_cmd)
+        return self
+
+    def _do_command(self, obdiag):
+        return obdiag.tool_sql_syntax(self.opts)
 
 
 class ObdiagGatherCommand(MajorCommand):
@@ -1404,8 +1433,8 @@ class ObdiagAnalyzeCommand(MajorCommand):
         self.register_command(ObdiagAnalyzeQueueCommand())
         self.register_command(ObdiagAnalyzeIndexSpaceCommand())
         self.register_command(ObdiagAnalyzeMemoryCommand())
-        # self.register_command(ObdiagAnalyzeSQLCommand())
-        # self.register_command(ObdiagAnalyzeSQLReviewCommand())
+        self.register_command(ObdiagAnalyzeSQLCommand())
+        self.register_command(ObdiagAnalyzeSQLReviewCommand())
 
 
 class ObdiagRCACommand(MajorCommand):
@@ -1429,8 +1458,8 @@ class ToolCommand(MajorCommand):
         super(ToolCommand, self).__init__('tool', 'obdiag tool')
         self.register_command(ObdiagToolCryptoConfigCommand())
         self.register_command(ObdiagToolIoPerformanceCommand())
-        self.register_command(ObdiagToolAiAssistantCommand())
         self.register_command(ObdiagToolConfigCheckCommand())
+        self.register_command(ObdiagToolSqlSyntaxCommand())
 
 
 class MainCommand(MajorCommand):
@@ -1445,6 +1474,7 @@ class MainCommand(MajorCommand):
         self.register_command(ObdiagRCACommand())
         self.register_command(ObdiagConfigCommand())
         self.register_command(ObdiagUpdateCommand())
+        self.register_command(ObdiagAgentCommand())
         self.register_command(ToolCommand())
         self.parser.version = get_obdiag_version()
         self.parser._add_version_option()

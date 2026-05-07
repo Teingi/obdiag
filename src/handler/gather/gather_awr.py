@@ -21,7 +21,7 @@ import time
 import datetime
 import tabulate
 import requests
-from src.common.obdiag_exception import OBDIAGFormatException
+from src.common.exception import OBDIAGFormatException
 from src.common.tool import DirectoryUtil
 from src.common.tool import FileUtil
 from src.common.tool import Util
@@ -199,7 +199,7 @@ class GatherAwrHandler(object):
                 except KeyError:
                     self.stdio.error(f"Malformed snapshot data: {info}")
                     continue
-                except Exception as e:
+                except Exception:
                     continue
         except requests.exceptions.RequestException as e:
             self.stdio.error(f"Failed to fetch snapshot list from OCP: {e}")

@@ -70,7 +70,7 @@ from src.common.ob_connector import OBConnector
 
 class ObdiagHome(object):
 
-    def __init__(self, stdio=None, config_path=os.path.expanduser('~/.obdiag/config.yml'), inner_config_change_map=None, custom_config_env_list=None, config_password=None):
+    def __init__(self, stdio=None, config_path=None, inner_config_change_map=None, custom_config_env_list=None, config_password=None):
         self._optimize_manager = None
         self.stdio = None
         self._stdio_func = None
@@ -491,15 +491,18 @@ class ObdiagHome(object):
                 self.set_context(function_type, 'analyze', config)
                 handler = AnalyzeVariableHandler(self.context, 'diff')
                 return handler.handle()
-            # todo not support silent
             elif function_type == 'analyze_sql':
+                self.set_context_stdio()
+                self.update_obcluster_nodes(config)
                 self.set_context(function_type, 'analyze', config)
                 handler = AnalyzeSQLHandler(self.context)
-                handler.handle()
+                return handler.handle()
             elif function_type == 'analyze_sql_review':
+                self.set_context_stdio()
+                self.update_obcluster_nodes(config)
                 self.set_context(function_type, 'analyze', config)
                 handler = AnalyzeSQLReviewHandler(self.context)
-                handler.handle()
+                return handler.handle()
             elif function_type == 'analyze_index_space':
                 self.set_context(function_type, 'analyze', config)
                 handler = AnalyzeIndexSpaceHandler(self.context)
@@ -551,7 +554,8 @@ class ObdiagHome(object):
                     observer_report_path = os.path.expanduser(observer_check_handler.report.get_report_path())
                     if os.path.exists(observer_report_path):
                         result_data['observer_report_path'] = os.path.abspath(observer_report_path)
-                        self.stdio.print("Check observer finished. For more details, please run cmd'" + Fore.YELLOW + " cat {0} ".format(observer_check_handler.report.get_report_path()) + Style.RESET_ALL + "'")
+                        self.stdio.print("Check observer finished. For more details, please run cmd '" + Fore.YELLOW + " cat {0} ".format(observer_check_handler.report.get_report_path()) + Style.RESET_ALL + "'")
+                self.stdio.print('\nTips: If you run into SSH connection issues with obdiag, try lowering concurrency by adding --inner_config check.max_workers=1 to the command.')
                 return ObdiagResult(ObdiagResult.SUCCESS_CODE, data=result_data)
             except Exception as e:
                 self.stdio.error("check Exception: {0}".format(e))
@@ -617,14 +621,14 @@ class ObdiagHome(object):
             handler = CryptoConfigHandler(self.context)
             return handler.handle()
 
-    def tool_ai_assistant(self, opt):
+    def agent(self, opt):
         config = self.config_manager
         if not config:
             self._call_stdio('error', 'No such custom config')
             return ObdiagResult(ObdiagResult.INPUT_ERROR_CODE, error_data='No such custom config')
         else:
-            self.set_offline_context('tool_ai_assistant', 'tool_ai_assistant')
-            from src.handler.ai.ai_assistant_handler import AiAssistantHandler
+            self.set_offline_context('agent', 'agent')
+            from src.handler.agent import AiAssistantHandler
 
             handler = AiAssistantHandler(self.context)
             return handler.handle()
@@ -652,6 +656,18 @@ class ObdiagHome(object):
             from src.handler.tools.io_performance_handler import IoPerformanceHandler
 
             handler = IoPerformanceHandler(self.context)
+            return handler.handle()
+
+    def tool_sql_syntax(self, opt):
+        config = self.config_manager
+        if not config:
+            self._call_stdio('error', 'No such custom config')
+            return ObdiagResult(ObdiagResult.INPUT_ERROR_CODE, error_data='No such custom config')
+        else:
+            self.set_context_skip_cluster_conn('tool_sql_syntax', 'tool_sql_syntax', config)
+            from src.handler.tools.sql_syntax_handler import SqlSyntaxHandler
+
+            handler = SqlSyntaxHandler(self.context)
             return handler.handle()
 
     def config(self, opt):
